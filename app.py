@@ -1,6 +1,42 @@
-from flask import Flask, render_template_string
+import hmac
+import http.client
+import ipaddress
+import os
+import secrets
+import socket
+import sqlite3
+import ssl
+import time
+from contextlib import contextmanager
+from functools import wraps
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from flask import (
+    Flask,
+    abort,
+    flash,
+    redirect,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
 
 app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+)
+
+DATABASE_PATH = Path(
+    os.environ.get("DATABASE_PATH", Path(app.instance_path) / "status.db")
+)
+CHECK_INTERVAL = 60
+MAX_SITES = 50
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
 HTML = r"""
 <!DOCTYPE html>
@@ -70,11 +106,16 @@ font-size:20px;
 font-weight:900;
 }
 
-.brand img{
+.brand-mark{
 width:42px;
 height:42px;
-object-fit:contain;
-border-radius:10px;
+display:grid;
+place-items:center;
+background:rgba(57,255,136,.1);
+border:1px solid rgba(57,255,136,.25);
+border-radius:12px;
+color:#39ff88;
+font-size:23px;
 }
 
 .brand span{color:#39ff88}
@@ -145,7 +186,13 @@ to{opacity:1;transform:translateY(0)}
 .hero-logo{
 width:110px;
 height:110px;
-object-fit:contain;
+display:grid;
+place-items:center;
+border:1px solid rgba(57,255,136,.3);
+border-radius:30px;
+background:rgba(57,255,136,.08);
+color:#39ff88;
+font-size:64px;
 margin-bottom:20px;
 filter:drop-shadow(0 0 30px rgba(57,255,136,.4));
 animation:logoFloat 4s ease-in-out infinite;
@@ -406,7 +453,7 @@ transform:translateY(0);
 .plan-btn{background:linear-gradient(135deg, #39ff88 0%, #10b981 100%);color:#001508;font-weight:900;letter-spacing:0.5px;text-transform:uppercase;border-radius:12px;padding:14px;box-shadow:0 4px 15px rgba(57,255,136,0.3);}
 .plan-btn:hover{box-shadow:0 0 25px rgba(57,255,136,0.7);transform:scale(1.03);}
 .popular{background:linear-gradient(90deg, #39ff88, #00ffaa);color:#000;font-weight:900;letter-spacing:1px;padding:5px 14px;border-radius:12px;box-shadow:0 0 15px rgba(57,255,136,0.6);}
-.brand img{width:42px;height:42px;object-fit:contain;filter:drop-shadow(0 0 10px #39ff88);border-radius:10px}
+.brand-mark{filter:drop-shadow(0 0 10px rgba(57,255,136,.3))}
 .plan:hover{border-color:#39ff88;transform:translateY(-6px);box-shadow:0 10px 30px rgba(57,255,136,.15)}
 .plan.featured{border:2px solid #39ff88;background:rgba(12,35,22,.95)}
 .plan-name{font-size:22px;font-weight:900;margin-bottom:10px;color:#fff}
@@ -472,7 +519,9 @@ footer{text-align:center;padding:45px 20px;border-top:1px solid rgba(57,255,136,
 .avatar{width:42px;height:42px;background:linear-gradient(135deg,#39ff88,#10b981);color:#000;border-radius:50%;display:grid;place-items:center;font-weight:900;font-size:18px}
 
 @media(max-width:700px){
-.nav-links a:not(.discord-btn){display:none}
+.nav-links a:not(.discord-btn):not(.status-link){display:none}
+.nav-links{gap:10px}
+.status-link{font-size:12px!important}
 
 .stats-grid{
 grid-template-columns:repeat(2,1fr);
@@ -504,7 +553,7 @@ h1{letter-spacing:-2px}
 
 <nav>
 <a href="#home" class="brand">
-<img src="https://cdn.discordapp.com/attachments/1554852353889411182/1554916279494905947/file_00000000dacc720bb265345759986b31-10-1.png?backend=b2src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"ex=6abea021src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"is=6abd4ea1src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"hm=8fe3599bde5c87065cc6644574280a8eb7a344eab3b29a8d92f68f6c443f3585src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"">
+<span class="brand-mark" aria-hidden="true">⛏</span>
 🎮 MINE<span>HOSTING</span>
 </a>
 
@@ -514,22 +563,18 @@ h1{letter-spacing:-2px}
 <a href="#minecraft">⛏️ Minecraft</a>
 <a href="#vps">🖥️ VPS</a>
 <a href="#reviews">💬 Reviews</a>
+<a class="status-link" href="/status">● Status</a>
 <a class="discord-btn" href="https://discord.gg/JzaPaJWdA7" target="_blank">Discord ↗</a>
 </div>
 </nav>
 
 <section class="hero" id="home">
 
-<video class="hero-video" autoplay muted loop playsinline>
-<source src="https://cdn.discordapp.com/attachments/1554852353889411182/1554916279494905947/file_00000000dacc720bb265345759986b31-10-1.png?backend=b2src="https://assets.mixkit.co/videos/preview/mixkit-digital-network-nodes-and-connections-43033-large.mp4"ex=6abea021src="https://assets.mixkit.co/videos/preview/mixkit-digital-network-nodes-and-connections-43033-large.mp4"is=6abd4ea1src="https://assets.mixkit.co/videos/preview/mixkit-digital-network-nodes-and-connections-43033-large.mp4"hm=8fe3599bde5c87065cc6644574280a8eb7a344eab3b29a8d92f68f6c443f3585src="https://assets.mixkit.co/videos/preview/mixkit-digital-network-nodes-and-connections-43033-large.mp4"" type="video/mp4">
-</video>
-
 <div class="hero-overlay"></div>
 
 <div class="hero-content">
 
-<img class="hero-logo"
-src="https://cdn.discordapp.com/attachments/1554852353889411182/1554916279494905947/file_00000000dacc720bb265345759986b31-10-1.png?backend=b2src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"ex=6abea021src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"is=6abd4ea1src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"hm=8fe3599bde5c87065cc6644574280a8eb7a344eab3b29a8d92f68f6c443f3585src="https://cdn-icons-png.flaticon.com/512/3593/3593452.png"">
+<div class="hero-logo" aria-hidden="true">⛏</div>
 
 <div class="badge">⚡ POWERING YOUR SERVERS</div>
 
@@ -1223,6 +1268,11 @@ All rights reserved.
 
 <br><br>
 
+<a href="/status">Service Status</a> ·
+<a href="/admin">Admin</a>
+
+<br><br>
+
 ⛏️ Minecraft is a trademark of Mojang Studios.
 MineHosting is not affiliated with Mojang.
 
@@ -1312,15 +1362,394 @@ rgba(57,255,136,.035),
 """
 
 
-@app.route("/")
+STATUS_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#07100c">
+<title>Status — MineHosting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--bg:#07100c;--panel:#0d1912;--line:#1c3425;--text:#eef7f0;--muted:#91a497;--green:#42e887;--red:#ff6677;--yellow:#f6c85f}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% -20%,#163321 0,transparent 58%),var(--bg);color:var(--text);font:15px Inter,system-ui,sans-serif;min-height:100vh}
+a{color:inherit;text-decoration:none}.wrap{width:min(920px,calc(100% - 36px));margin:auto}
+header{height:76px;border-bottom:1px solid #ffffff0d;display:flex;align-items:center}.nav{display:flex;justify-content:space-between;align-items:center}
+.brand{font-weight:800;letter-spacing:-.4px}.brand b{color:var(--green)}.nav-links{display:flex;gap:22px;color:var(--muted);font-size:13px;font-weight:600}.nav-links a:hover{color:var(--green)}
+main{padding:74px 0 90px}.eyebrow{color:var(--green);font-size:11px;letter-spacing:2.5px;font-weight:800;text-transform:uppercase}
+h1{font-size:clamp(34px,6vw,54px);letter-spacing:-2px;margin:12px 0}.intro{color:var(--muted);line-height:1.75;max-width:620px}
+.summary{margin:34px 0 22px;padding:22px 24px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(135deg,#102219,#0b1710);display:flex;align-items:center;gap:15px}
+.summary-icon{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:#42e8871c;color:var(--green);font-size:19px}
+.summary strong{display:block;font-size:15px}.summary small{display:block;color:var(--muted);margin-top:5px}
+.summary.down .summary-icon{background:#ff66771a;color:var(--red)}.summary.degraded .summary-icon{background:#f6c85f1a;color:var(--yellow)}
+.list{display:grid;gap:12px}.site{padding:19px 21px;border:1px solid var(--line);border-radius:14px;background:#0b1710;display:flex;align-items:center;justify-content:space-between;gap:18px;transition:border-color .2s}
+.site:hover{border-color:#42e88766}.site h2{font-size:15px;margin:0 0 7px}.site-url{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.meta{display:flex;align-items:center;gap:14px;flex-shrink:0}.checked{font-size:11px;color:var(--muted);text-align:right}
+.pill{display:inline-flex;align-items:center;gap:7px;border-radius:30px;padding:7px 10px;font-size:11px;font-weight:700;white-space:nowrap;background:#42e88714;color:var(--green)}
+.pill:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.pill.down{background:#ff667714;color:var(--red)}.pill.unknown{background:#f6c85f14;color:var(--yellow)}
+.empty{padding:44px 24px;border:1px dashed #294332;border-radius:15px;text-align:center;color:var(--muted);line-height:1.7}.empty strong{display:block;color:var(--text);margin-bottom:5px}
+footer{border-top:1px solid #ffffff0d;padding:22px 0;color:#6e8275;font-size:11px}
+@media(max-width:600px){main{padding:52px 0}.nav-links{gap:13px;font-size:12px}.site{align-items:flex-start;padding:17px}.meta{display:block;text-align:right}.checked{margin-top:8px}.pill{font-size:10px}}
+</style>
+</head>
+<body>
+<header><div class="wrap nav"><a class="brand" href="/">⛏ MINE<b>HOSTING</b></a><nav class="nav-links"><a href="/">Home</a><a href="/admin">Admin</a></nav></div></header>
+<main class="wrap">
+<div class="eyebrow">Live service monitoring</div>
+<h1>System status</h1>
+<p class="intro">A live overview of MineHosting services. Each service is checked automatically and refreshed every minute.</p>
+{% if sites %}
+  {% set online = sites|selectattr("status", "equalto", "up")|list|length %}
+  {% set down = sites|selectattr("status", "equalto", "down")|list|length %}
+  {% if down %}
+    {% set overall = "down" if online == 0 else "degraded" %}
+    {% set overall_text = "Some services are experiencing issues" if online else "Service disruption detected" %}
+    {% set overall_icon = "!" %}
+  {% else %}
+    {% set overall = "" %}
+    {% set overall_text = "All systems operational" %}
+    {% set overall_icon = "✓" %}
+  {% endif %}
+  <div class="summary {{ overall }}"><div class="summary-icon">{{ overall_icon }}</div><div><strong>{{ overall_text }}</strong><small>{{ online }} of {{ sites|length }} services operational</small></div></div>
+  <div class="list">
+  {% for site in sites %}
+    <article class="site">
+      <div><h2>{{ site.name }}</h2><a class="site-url" href="{{ site.url }}" target="_blank" rel="noopener noreferrer">{{ site.url }}</a></div>
+      <div class="meta"><span class="pill {{ 'down' if site.status == 'down' else 'unknown' if site.status == 'unknown' else '' }}">{{ 'Operational' if site.status == 'up' else 'Checking' if site.status == 'unknown' else 'Unavailable' }}</span><span class="checked">{% if site.checked_at %}{{ site.checked_at }} UTC{% else %}Not checked yet{% endif %}{% if site.response_ms is not none %}<br>{{ site.response_ms }} ms{% endif %}</span></div>
+    </article>
+  {% endfor %}
+  </div>
+{% else %}
+  <div class="summary"><div class="summary-icon">i</div><div><strong>Monitoring is being set up</strong><small>No services have been added yet.</small></div></div>
+  <div class="empty"><strong>No monitored services</strong>Come back soon for live updates.</div>
+{% endif %}
+</main>
+<footer><div class="wrap">Status checks run once per minute. &copy; 2026 MineHosting</div></footer>
+</body>
+</html>
+"""
+
+ADMIN_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#07100c">
+<title>{{ 'Admin login' if login else 'Manage services' }} — MineHosting</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--bg:#07100c;--panel:#0d1912;--line:#1c3425;--text:#eef7f0;--muted:#91a497;--green:#42e887;--red:#ff6677}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% -20%,#163321 0,transparent 58%),var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif;min-height:100vh}
+a{color:inherit;text-decoration:none}.wrap{width:min(920px,calc(100% - 36px));margin:auto}header{height:76px;border-bottom:1px solid #ffffff0d;display:flex;align-items:center}
+.nav{display:flex;align-items:center;justify-content:space-between}.brand{font-weight:800}.brand b{color:var(--green)}.nav-links{display:flex;align-items:center;gap:20px;color:var(--muted);font-size:12px}
+main{padding:55px 0 80px}h1{font-size:32px;letter-spacing:-1px;margin:0 0 8px}p.sub{color:var(--muted);margin:0 0 28px}
+.panel{background:#0b1710;border:1px solid var(--line);border-radius:16px;padding:24px;margin:18px 0}.panel h2{font-size:16px;margin:0 0 18px}
+.grid{display:grid;grid-template-columns:1fr 1.4fr auto;align-items:end;gap:12px}.field label{display:block;color:#b8c8bc;font-size:12px;font-weight:600;margin:0 0 8px}
+input{width:100%;height:44px;padding:0 13px;border:1px solid #284231;border-radius:9px;background:#07110b;color:var(--text);font:inherit;outline:none}
+input:focus{border-color:var(--green);box-shadow:0 0 0 3px #42e88718}button,.button{border:0;border-radius:9px;background:var(--green);color:#06120a;font:700 12px Inter,system-ui,sans-serif;padding:0 17px;height:44px;cursor:pointer;white-space:nowrap}
+button:hover,.button:hover{filter:brightness(1.08)}.button.secondary{height:36px;background:#14251a;color:#c9d7cd;border:1px solid var(--line)}
+.flash{padding:12px 14px;border:1px solid #ff667755;border-radius:9px;background:#ff667710;color:#ff9ba6;margin:0 0 15px}
+.pill{display:inline-flex;align-items:center;gap:7px;border-radius:30px;padding:7px 10px;font-size:11px;font-weight:700;white-space:nowrap;background:#42e88714;color:#42e887}
+.pill:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.pill.down{background:#ff667714;color:#ff6677}
+.table{display:grid;gap:10px}.row{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:15px;background:#0d1b12;border:1px solid #1a3022;border-radius:11px}.row-info{min-width:0}.row-info strong{display:block;margin-bottom:5px}.row-info a{color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+.row-actions{display:flex;align-items:center;gap:10px;flex-shrink:0}.delete{background:#ff667718;color:#ff8793;border:1px solid #ff667733;height:35px;padding:0 12px}
+.empty{color:var(--muted);padding:20px;text-align:center;border:1px dashed #294332;border-radius:10px}
+.login{max-width:430px;margin:6vh auto}.login .field{margin:15px 0}.login button{width:100%;margin-top:7px}
+@media(max-width:650px){.grid{grid-template-columns:1fr}.grid button{width:100%}.panel{padding:18px}.row{align-items:flex-start;flex-direction:column}.row-actions{width:100%;justify-content:space-between}.login{margin-top:2vh}}
+</style>
+</head>
+<body>
+<header><div class="wrap nav"><a class="brand" href="/">⛏ MINE<b>HOSTING</b></a><nav class="nav-links"><a href="/">Home</a><a href="/status">Public status</a>{% if not login %}<form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="button secondary" type="submit">Log out</button></form>{% endif %}</nav></div></header>
+<main class="wrap">
+{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}
+{% if login %}
+<section class="panel login"><h1>Admin sign in</h1><p class="sub">Sign in to manage monitored services.</p>
+{% if not configured %}<div class="flash">Admin credentials are not configured. Set ADMIN_USERNAME and ADMIN_PASSWORD in the service environment.</div>{% endif %}
+<form method="post" action="/admin/login">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<div class="field"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required maxlength="80"></div>
+<div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
+<button type="submit" {% if not configured %}disabled{% endif %}>Sign in</button>
+</form></section>
+{% else %}
+<h1>Manage monitored services</h1><p class="sub">Add websites to the public MineHosting status page.</p>
+<section class="panel"><h2>Add a service</h2>
+<form class="grid" method="post" action="/admin/sites/add">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<div class="field"><label for="name">Site name</label><input id="name" name="name" maxlength="80" placeholder="Main Website" required></div>
+<div class="field"><label for="url">Website URL</label><input id="url" name="url" type="url" maxlength="2048" placeholder="https://example.com" required></div>
+<button type="submit">Add service</button>
+</form></section>
+<section class="panel"><h2>Monitored services ({{ sites|length }}/{{ max_sites }})</h2>
+{% if sites %}<div class="table">{% for site in sites %}<article class="row"><div class="row-info"><strong>{{ site.name }}</strong><a href="{{ site.url }}" target="_blank" rel="noopener noreferrer">{{ site.url }}</a></div><div class="row-actions"><span class="pill {{ 'down' if site.status == 'down' else '' }}">{{ 'Operational' if site.status == 'up' else 'Unavailable' if site.status == 'down' else 'Waiting for first check' }}</span><form method="post" action="/admin/sites/{{ site.id }}/delete" onsubmit="return confirm('Remove this service from monitoring?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="delete" type="submit">Remove</button></form></div></article>{% endfor %}</div>{% else %}<div class="empty">No services added yet.</div>{% endif %}
+</section>
+{% endif %}
+</main>
+</body>
+</html>
+"""
+
+
+def csrf_token():
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return session["csrf_token"]
+
+
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+@contextmanager
+def database():
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS monitored_sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            http_status INTEGER,
+            response_ms INTEGER,
+            checked_at REAL
+        )"""
+    )
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def validate_site_url(value):
+    if not value or len(value) > 2048 or any(char.isspace() for char in value):
+        raise ValueError("Enter a valid public HTTP or HTTPS website URL.")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Enter a valid public HTTP or HTTPS website URL.") from exc
+    if (
+        parsed.scheme not in ("http", "https")
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port not in (None, 80 if parsed.scheme == "http" else 443)
+    ):
+        raise ValueError("Use a public website URL on standard HTTP or HTTPS.")
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower()
+        address = ipaddress.ip_address(hostname.strip("[]"))
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("Private and reserved IP addresses cannot be monitored.")
+    if hostname in ("localhost",) or hostname.endswith(".localhost"):
+        raise ValueError("Local addresses cannot be monitored.")
+    netloc = f"[{hostname}]" if ":" in hostname else hostname
+    return urlunsplit((parsed.scheme, netloc, parsed.path or "/", parsed.query, ""))
+
+
+def resolve_public_addresses(hostname, port):
+    try:
+        records = socket.getaddrinfo(
+            hostname, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+        )
+    except OSError:
+        return []
+    addresses = list(dict.fromkeys(record[4][0] for record in records))
+    if not addresses or any(
+        not ipaddress.ip_address(address.split("%", 1)[0]).is_global
+        for address in addresses
+    ):
+        return []
+    return addresses
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, hostname, port, address):
+        super().__init__(hostname, port, timeout=5)
+        self.address = address
+
+    def connect(self):
+        self.sock = socket.create_connection((self.address, self.port), self.timeout)
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname, port, address):
+        super().__init__(hostname, port, timeout=5, context=ssl.create_default_context())
+        self.address = address
+
+    def connect(self):
+        raw_socket = socket.create_connection((self.address, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def check_site(url):
+    parsed = urlsplit(url)
+    hostname = parsed.hostname
+    port = 443 if parsed.scheme == "https" else 80
+    addresses = resolve_public_addresses(hostname, port)
+    if not addresses:
+        return "down", None, None
+    path = parsed.path or "/"
+    if parsed.query:
+        path += f"?{parsed.query}"
+    connection_type = PinnedHTTPSConnection if parsed.scheme == "https" else PinnedHTTPConnection
+    start = time.monotonic()
+    connection = connection_type(hostname, port, addresses[0])
+    try:
+        connection.request(
+            "GET",
+            path,
+            headers={"User-Agent": "MineHosting-Status/1.0", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        response_status = response.status
+        response.close()
+        elapsed = round((time.monotonic() - start) * 1000)
+        return ("up" if response_status < 400 else "down"), response_status, elapsed
+    except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException, ValueError):
+        return "down", None, round((time.monotonic() - start) * 1000)
+    finally:
+        connection.close()
+
+
+def get_sites(check=False):
+    with database() as db:
+        sites = [dict(row) for row in db.execute("SELECT * FROM monitored_sites ORDER BY id")]
+        if check:
+            now = time.time()
+            for site in sites:
+                if site["checked_at"] is None or now - site["checked_at"] >= CHECK_INTERVAL:
+                    status, http_status, response_ms = check_site(site["url"])
+                    checked_at = time.time()
+                    db.execute(
+                        """UPDATE monitored_sites
+                           SET status = ?, http_status = ?, response_ms = ?, checked_at = ?
+                           WHERE id = ?""",
+                        (status, http_status, response_ms, checked_at, site["id"]),
+                    )
+                    site.update(
+                        status=status,
+                        http_status=http_status,
+                        response_ms=response_ms,
+                        checked_at=checked_at,
+                    )
+    for site in sites:
+        site["checked_at"] = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(site["checked_at"]))
+            if site["checked_at"] is not None
+            else None
+        )
+    return sites
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("admin_authenticated"):
+            return redirect(url_for("admin_login"))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def verify_csrf():
+    token = request.form.get("csrf_token", "")
+    expected = session.get("csrf_token", "")
+    if not expected or not hmac.compare_digest(token, expected):
+        abort(400)
+
 
 @app.route("/")
 def home():
     return render_template_string(HTML)
 
+
+@app.route("/status")
+def status_page():
+    return render_template_string(STATUS_HTML, sites=get_sites(check=True))
+
+
+@app.route("/admin", methods=["GET"])
+@admin_required
+def admin_dashboard():
+    return render_template_string(ADMIN_HTML, login=False, sites=get_sites(), max_sites=MAX_SITES)
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    configured = bool(os.environ.get("ADMIN_USERNAME") and os.environ.get("ADMIN_PASSWORD"))
+    if request.method == "POST":
+        verify_csrf()
+        username = os.environ.get("ADMIN_USERNAME", "")
+        password = os.environ.get("ADMIN_PASSWORD", "")
+        if (
+            configured
+            and hmac.compare_digest(request.form.get("username", ""), username)
+            and hmac.compare_digest(request.form.get("password", ""), password)
+        ):
+            session.clear()
+            session["admin_authenticated"] = True
+            return redirect(url_for("admin_dashboard"))
+        flash("Invalid username or password.")
+    return render_template_string(ADMIN_HTML, login=True, configured=configured)
+
+
+@app.route("/admin/logout", methods=["POST"])
+@admin_required
+def admin_logout():
+    verify_csrf()
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+
+@app.route("/admin/sites/add", methods=["POST"])
+@admin_required
+def add_site():
+    verify_csrf()
+    name = request.form.get("name", "").strip()
+    if not name or len(name) > 80:
+        flash("Site name must be between 1 and 80 characters.")
+        return redirect(url_for("admin_dashboard"))
+    try:
+        site_url = validate_site_url(request.form.get("url", "").strip())
+    except ValueError as exc:
+        flash(str(exc))
+        return redirect(url_for("admin_dashboard"))
+    with database() as db:
+        count = db.execute("SELECT COUNT(*) FROM monitored_sites").fetchone()[0]
+        if count >= MAX_SITES:
+            flash(f"You can monitor up to {MAX_SITES} services.")
+        else:
+            db.execute("INSERT INTO monitored_sites (name, url) VALUES (?, ?)", (name, site_url))
+            flash("Service added.")
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/sites/<int:site_id>/delete", methods=["POST"])
+@admin_required
+def delete_site(site_id):
+    verify_csrf()
+    with database() as db:
+        db.execute("DELETE FROM monitored_sites WHERE id = ?", (site_id,))
+    flash("Service removed.")
+    return redirect(url_for("admin_dashboard"))
+
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=2000,
+        port=int(os.environ.get("PORT", "2000")),
         debug=False
     )
